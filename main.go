@@ -139,17 +139,7 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 		var buffer [65536]byte
 		done := false
 		for !done {
-			var n int
-			var err error
-			buffered := b.Reader.Buffered()
-			if buffered > 0 {
-				if buffered > len(buffer) {
-					buffered = len(buffer)
-				}
-				n, err = b.Read(buffer[:buffered])
-			} else {
-				n, err = local.Read(buffer[:])
-			}
+			n, err := b.Read(buffer[:])
 			if n > 0 {
 				_, werr := remote.Write(buffer[:n])
 				if werr != nil {
