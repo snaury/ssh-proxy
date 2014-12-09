@@ -56,7 +56,8 @@ type SecureReverseProxy struct {
 func NewSecureReverseProxy(remote *ssh.Client) *SecureReverseProxy {
 	p := &SecureReverseProxy{}
 	p.remote = remote
-	p.proxy.Director = func(req *http.Request) {}
+	p.proxy.Director = func(req *http.Request) {
+	}
 	p.proxy.Transport = &http.Transport{
 		Proxy: nil,
 		Dial: func(n, addr string) (net.Conn, error) {
@@ -186,7 +187,7 @@ func main() {
 	fmt.Printf("Client version: %s\n", client.ClientVersion())
 	fmt.Printf("Server version: %s\n", client.ServerVersion())
 	p := NewSecureReverseProxy(client)
-	err = p.ListenAndServe(":8080")
+	err = p.ListenAndServe("127.0.0.1:8080")
 	if err != nil {
 		panic(err)
 	}
