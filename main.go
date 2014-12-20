@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/user"
 	"strings"
@@ -48,9 +49,35 @@ func loadKeyFile(filename string) (key ssh.Signer, err error) {
 	return
 }
 
+func extractHost(url *url.URL) string {
+	host := url.Host
+	cindex := strings.Index(host, ":")
+	if cindex != -1 {
+		host = host[:cindex]
+	}
+	return host
+}
+
+func extractHostPort(url *url.URL, defaultPort int) string {
+	hostport := url.Host
+	cindex := strings.Index(hostport, ":")
+	if cindex == -1 {
+		hostport = fmt.Sprintf("%s:%d", hostport, defaultPort)
+	}
+	return hostport
+}
+
 type SecureReverseProxy struct {
 	remote *ssh.Client
 	proxy  httputil.ReverseProxy
+}
+
+func (p *SecureReverseProxy) isBlocked(url *url.URL) bool {
+	return false
+}
+
+func (p *SecureReverseProxy) isForcedSSL(url *url.URL) bool {
+	return false
 }
 
 func NewSecureReverseProxy(remote *ssh.Client) *SecureReverseProxy {
@@ -78,12 +105,13 @@ func isNormalError(err error) bool {
 }
 
 func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if p.isBlocked(req.URL) {
+		rw.WriteHeader(503)
+		io.WriteString(rw, "Server blocked")
+		return
+	}
 	if req.Method == "CONNECT" {
-		hostport := req.URL.Host
-		cindex := strings.Index(hostport, ":")
-		if cindex == -1 {
-			hostport += ":443"
-		}
+		hostport := extractHostPort(req.URL, 443)
 		log.Printf("%s %s", req.Method, hostport)
 
 		rwh, ok := rw.(http.Hijacker)
@@ -97,6 +125,7 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 		if err != nil {
 			rw.WriteHeader(503)
 			io.WriteString(rw, "CONNECT failed: "+err.Error())
+			return
 		}
 		defer remote.Close()
 
@@ -160,6 +189,9 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 		return
 	}
 
+	if req.URL.Scheme == "http" && p.isForcedSSL(req.URL) {
+		req.URL.Scheme = "https"
+	}
 	log.Printf("%s %s", req.Method, req.URL)
 	p.proxy.ServeHTTP(rw, req)
 }
