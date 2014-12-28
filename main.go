@@ -49,6 +49,14 @@ func loadKeyFile(filename string) (key ssh.Signer, err error) {
 	return
 }
 
+func ensurePort(host string, defaultPort int) string {
+	cindex := strings.Index(host, ":")
+	if cindex == -1 {
+		return fmt.Sprintf("%s:%d", host, defaultPort)
+	}
+	return host
+}
+
 func extractHost(url *url.URL) string {
 	host := url.Host
 	cindex := strings.Index(host, ":")
@@ -211,7 +219,8 @@ func main() {
 			ssh.PublicKeys(key),
 		},
 	}
-	client, err := ssh.Dial("tcp", os.Args[1], config)
+	host := ensurePort(os.Args[1], 22)
+	client, err := ssh.Dial("tcp", host, config)
 	if err != nil {
 		panic(err)
 	}
