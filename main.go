@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/user"
 	"strings"
+	"sync"
+	"time"
 )
 
 func currentUser() *user.User {
@@ -76,8 +78,11 @@ func extractHostPort(url *url.URL, defaultPort int) string {
 }
 
 type SecureReverseProxy struct {
-	remote *ssh.Client
-	proxy  httputil.ReverseProxy
+	host            string
+	config          *ssh.ClientConfig
+	remoteAvailable *sync.Cond
+	remote          *ssh.Client
+	proxy           httputil.ReverseProxy
 }
 
 func (p *SecureReverseProxy) isBlocked(url *url.URL) bool {
@@ -88,18 +93,58 @@ func (p *SecureReverseProxy) isForcedSSL(url *url.URL) bool {
 	return false
 }
 
-func NewSecureReverseProxy(remote *ssh.Client) *SecureReverseProxy {
+func NewSecureReverseProxy(host string, config *ssh.ClientConfig) *SecureReverseProxy {
 	p := &SecureReverseProxy{}
-	p.remote = remote
+	p.host = host
+	p.config = config
+	p.remoteAvailable = sync.NewCond(&sync.Mutex{})
 	p.proxy.Director = func(req *http.Request) {
 	}
 	p.proxy.Transport = &http.Transport{
 		Proxy: nil,
-		Dial: func(n, addr string) (net.Conn, error) {
-			return p.remote.Dial(n, addr)
-		},
+		Dial:  p.dial,
 	}
+	go p.reconnectLoop()
 	return p
+}
+
+func (p *SecureReverseProxy) reconnectLoop() {
+	p.remoteAvailable.L.Lock()
+	defer p.remoteAvailable.L.Unlock()
+	for {
+		log.Printf("Connecting to %s...", p.host)
+		remote, err := ssh.Dial("tcp", p.host, p.config)
+		if err != nil {
+			log.Printf("Connect failed: %s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		p.remote = remote
+		p.remoteAvailable.Broadcast()
+		p.remoteAvailable.L.Unlock()
+		log.Printf("Connected to %s\n", remote.ServerVersion())
+		err = remote.Wait()
+		p.remoteAvailable.L.Lock()
+		p.remote = nil
+		if err != nil {
+			log.Printf("Disconnected: %s", err)
+		}
+		remote.Close()
+	}
+}
+
+func (p *SecureReverseProxy) dial(n, addr string) (net.Conn, error) {
+	p.remoteAvailable.L.Lock()
+	for p.remote == nil {
+		p.remoteAvailable.Wait()
+	}
+	remote := p.remote
+	p.remoteAvailable.L.Unlock()
+	c, err := remote.Dial(n, addr)
+	if err != nil {
+		log.Printf("CONNECT %s: %s", addr, err)
+	}
+	return c, err
 }
 
 func isNormalError(err error) bool {
@@ -129,10 +174,11 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 			return
 		}
 
-		remote, err := p.remote.Dial("tcp", hostport)
+		remote, err := p.dial("tcp", hostport)
 		if err != nil {
 			rw.WriteHeader(503)
 			io.WriteString(rw, "CONNECT failed: "+err.Error())
+			log.Printf("%s %s: %s", req.Method, hostport, err)
 			return
 		}
 		defer remote.Close()
@@ -220,14 +266,7 @@ func main() {
 		},
 	}
 	host := ensurePort(os.Args[1], 22)
-	client, err := ssh.Dial("tcp", host, config)
-	if err != nil {
-		panic(err)
-	}
-	defer client.Close()
-	fmt.Printf("Client version: %s\n", client.ClientVersion())
-	fmt.Printf("Server version: %s\n", client.ServerVersion())
-	p := NewSecureReverseProxy(client)
+	p := NewSecureReverseProxy(host, config)
 	err = p.ListenAndServe("127.0.0.1:8080")
 	if err != nil {
 		panic(err)
