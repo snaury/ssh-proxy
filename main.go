@@ -172,15 +172,24 @@ func isNormalError(err error) bool {
 }
 
 func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	var url string
+	if req.Method == "CONNECT" {
+		url = extractHostPort(req.URL, 443)
+	} else {
+		if req.URL.Scheme == "http" && p.isForcedSSL(req.URL) {
+			req.URL.Scheme = "https"
+		}
+		url = req.URL.String()
+	}
+	log.Printf("%s %s", req.Method, url)
+
 	if p.isBlocked(req.URL) {
 		rw.WriteHeader(503)
 		io.WriteString(rw, "Server blocked")
 		return
 	}
-	if req.Method == "CONNECT" {
-		hostport := extractHostPort(req.URL, 443)
-		log.Printf("%s %s", req.Method, hostport)
 
+	if req.Method == "CONNECT" {
 		rwh, ok := rw.(http.Hijacker)
 		if !ok {
 			rw.WriteHeader(503)
@@ -188,11 +197,11 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 			return
 		}
 
-		remote, err := p.dial("tcp", hostport)
+		remote, err := p.dial("tcp", url)
 		if err != nil {
 			rw.WriteHeader(503)
 			io.WriteString(rw, "CONNECT failed: "+err.Error())
-			log.Printf("%s %s: %s", req.Method, hostport, err)
+			log.Printf("%s %s: %s", req.Method, url, err)
 			return
 		}
 		defer remote.Close()
@@ -219,14 +228,14 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 					_, werr := local.Write(buffer[:n])
 					if werr != nil {
 						if !isNormalError(werr) {
-							//log.Printf("%s: local write: %s", hostport, werr)
+							//log.Printf("%s: local write: %s", url, werr)
 						}
 						done = true
 					}
 				}
 				if err != nil {
 					if !isNormalError(err) {
-						//log.Printf("%s: remote read: %s", hostport, err)
+						//log.Printf("%s: remote read: %s", url, err)
 					}
 					done = true
 				}
@@ -242,14 +251,14 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 				_, werr := remote.Write(buffer[:n])
 				if werr != nil {
 					if !isNormalError(werr) {
-						//log.Printf("%s: remote write: %s", hostport, werr)
+						//log.Printf("%s: remote write: %s", url, werr)
 					}
 					done = true
 				}
 			}
 			if err != nil {
 				if !isNormalError(err) {
-					//log.Printf("%s: local read: %s", hostport, err)
+					//log.Printf("%s: local read: %s", url, err)
 				}
 				done = true
 			}
@@ -257,10 +266,6 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 		return
 	}
 
-	if req.URL.Scheme == "http" && p.isForcedSSL(req.URL) {
-		req.URL.Scheme = "https"
-	}
-	log.Printf("%s %s", req.Method, req.URL)
 	p.proxy.ServeHTTP(rw, req)
 }
 
