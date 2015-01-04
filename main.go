@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"os/user"
 	"strings"
 	"sync"
@@ -79,24 +79,38 @@ func extractHostPort(url *url.URL, defaultPort int) string {
 
 type SecureReverseProxy struct {
 	host            string
-	config          *ssh.ClientConfig
+	config          *config
+	sshConfig       *ssh.ClientConfig
 	remoteAvailable *sync.Cond
 	remote          *ssh.Client
 	proxy           httputil.ReverseProxy
 }
 
 func (p *SecureReverseProxy) isBlocked(url *url.URL) bool {
+	host := extractHost(url)
+	if p.config != nil && p.config.block != nil {
+		if p.config.block.MatchString(host) {
+			return true
+		}
+	}
 	return false
 }
 
 func (p *SecureReverseProxy) isForcedSSL(url *url.URL) bool {
+	host := extractHost(url)
+	if p.config != nil && p.config.https != nil {
+		if p.config.https.MatchString(host) {
+			return true
+		}
+	}
 	return false
 }
 
-func NewSecureReverseProxy(host string, config *ssh.ClientConfig) *SecureReverseProxy {
+func NewSecureReverseProxy(host string, config *config, sshConfig *ssh.ClientConfig) *SecureReverseProxy {
 	p := &SecureReverseProxy{}
 	p.host = host
 	p.config = config
+	p.sshConfig = sshConfig
 	p.remoteAvailable = sync.NewCond(&sync.Mutex{})
 	p.proxy.Director = func(req *http.Request) {
 	}
@@ -113,7 +127,7 @@ func (p *SecureReverseProxy) reconnectLoop() {
 	defer p.remoteAvailable.L.Unlock()
 	for {
 		log.Printf("Connecting to %s...", p.host)
-		remote, err := ssh.Dial("tcp", p.host, p.config)
+		remote, err := ssh.Dial("tcp", p.host, p.sshConfig)
 		if err != nil {
 			log.Printf("Connect failed: %s", err)
 			time.Sleep(5 * time.Second)
@@ -255,20 +269,37 @@ func (p *SecureReverseProxy) ListenAndServe(addr string) error {
 }
 
 func main() {
-	key, err := loadKeyFile(defaultKeyFile())
-	if err != nil {
-		panic(err)
+	var host string
+	var keyFile string = defaultKeyFile()
+	var configFile string = "config.txt"
+	var listenAddr string = "127.0.0.1:8080"
+	flag.StringVar(&host, "host", host, "ssh hostname")
+	flag.StringVar(&keyFile, "key", keyFile, "ssh key file")
+	flag.StringVar(&configFile, "config", configFile, "proxy config file")
+	flag.StringVar(&listenAddr, "listen", listenAddr, "proxy listen address")
+	flag.Parse()
+	if host == "" {
+		flag.Usage()
+		return
 	}
-	config := &ssh.ClientConfig{
+	host = ensurePort(host, 22)
+	key, err := loadKeyFile(keyFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	config, err := loadConfigFile(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	sshConfig := &ssh.ClientConfig{
 		User: defaultUsername(),
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(key),
 		},
 	}
-	host := ensurePort(os.Args[1], 22)
-	p := NewSecureReverseProxy(host, config)
-	err = p.ListenAndServe("127.0.0.1:8080")
+	p := NewSecureReverseProxy(host, config, sshConfig)
+	err = p.ListenAndServe(listenAddr)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 }
