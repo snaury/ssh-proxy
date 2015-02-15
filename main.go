@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"io"
 	"io/ioutil"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"os/user"
 	"strings"
 	"sync"
@@ -275,7 +277,7 @@ func (p *SecureReverseProxy) ListenAndServe(addr string) error {
 
 func main() {
 	var host string
-	var keyFile string = defaultKeyFile()
+	var keyFile string
 	var configFile string = "config.txt"
 	var listenAddr string = "127.0.0.1:8080"
 	flag.StringVar(&host, "host", host, "ssh hostname")
@@ -288,9 +290,39 @@ func main() {
 		return
 	}
 	host = ensurePort(host, 22)
-	key, err := loadKeyFile(keyFile)
-	if err != nil {
-		log.Fatal(err)
+
+	// Determine which auth methods we can use
+	var authMethods []ssh.AuthMethod
+	if authsock := os.Getenv("SSH_AUTH_SOCK"); authsock != "" {
+		// Connect to local ssh agent
+		var conn net.Conn
+		var err error
+		if authsock[0] == '/' || authsock[0] == '@' {
+			conn, err = net.Dial("unix", authsock)
+		} else {
+			conn, err = net.Dial("tcp", authsock)
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer conn.Close()
+		client := agent.NewClient(conn)
+		authMethods = append(authMethods, ssh.PublicKeysCallback(client.Signers))
+	}
+	if len(authMethods) == 0 && keyFile == "" {
+		// Use default key when there's no agent
+		keyFile = defaultKeyFile()
+	}
+	if keyFile != "" {
+		// Key file must not have a password
+		key, err := loadKeyFile(keyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(key))
+	}
+	if len(authMethods) == 0 {
+		log.Fatal("No authentication methods specified")
 	}
 	config, err := loadConfigFile(configFile)
 	if err != nil {
@@ -298,9 +330,7 @@ func main() {
 	}
 	sshConfig := &ssh.ClientConfig{
 		User: defaultUsername(),
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(key),
-		},
+		Auth: authMethods,
 	}
 	p := NewSecureReverseProxy(host, config, sshConfig)
 	err = p.ListenAndServe(listenAddr)
