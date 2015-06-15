@@ -175,19 +175,37 @@ func isNormalError(err error) bool {
 
 func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	var url string
+	var origurl string
+	redirect := false
 	if req.Method == "CONNECT" {
-		url = extractHostPort(req.URL, 443)
+		origurl = extractHostPort(req.URL, 443)
 	} else {
+		origurl = req.URL.String()
 		if req.URL.Scheme == "http" && p.isForcedSSL(req.URL) {
+			if req.Method == "GET" || req.Method == "HEAD" {
+				redirect = true
+			}
 			req.URL.Scheme = "https"
+			url = req.URL.String()
 		}
-		url = req.URL.String()
 	}
-	log.Printf("%s %s", req.Method, url)
+	if len(url) == 0 {
+		url = origurl
+	}
+	log.Printf("%s %s", req.Method, origurl)
 
 	if p.isBlocked(req.URL) {
 		rw.WriteHeader(503)
 		io.WriteString(rw, "Server blocked")
+		return
+	}
+
+	if redirect {
+		rw.Header().Set("Location", url)
+		rw.WriteHeader(307)
+		if req.Method == "GET" {
+			io.WriteString(rw, url)
+		}
 		return
 	}
 
