@@ -86,26 +86,19 @@ type SecureReverseProxy struct {
 	remoteAvailable *sync.Cond
 	remote          *ssh.Client
 	proxy           httputil.ReverseProxy
+	direct          httputil.ReverseProxy
 }
 
-func (p *SecureReverseProxy) isBlocked(url *url.URL) bool {
+func (p *SecureReverseProxy) getActions(url *url.URL) configActions {
 	host := extractHost(url)
-	if p.config != nil && p.config.block != nil {
-		if p.config.block.MatchString(host) {
-			return true
+	if p.config != nil {
+		for _, c := range p.config.cases {
+			if c.mask.MatchString(host) {
+				return c.actions
+			}
 		}
 	}
-	return false
-}
-
-func (p *SecureReverseProxy) isForcedSSL(url *url.URL) bool {
-	host := extractHost(url)
-	if p.config != nil && p.config.https != nil {
-		if p.config.https.MatchString(host) {
-			return true
-		}
-	}
-	return false
+	return actionNone
 }
 
 func NewSecureReverseProxy(host string, config *config, sshConfig *ssh.ClientConfig) *SecureReverseProxy {
@@ -114,12 +107,12 @@ func NewSecureReverseProxy(host string, config *config, sshConfig *ssh.ClientCon
 	p.config = config
 	p.sshConfig = sshConfig
 	p.remoteAvailable = sync.NewCond(&sync.Mutex{})
-	p.proxy.Director = func(req *http.Request) {
-	}
+	p.proxy.Director = func(req *http.Request) {}
 	p.proxy.Transport = &http.Transport{
 		Proxy: nil,
 		Dial:  p.dial,
 	}
+	p.direct.Director = func(req *http.Request) {}
 	go p.reconnectLoop()
 	return p
 }
@@ -176,12 +169,13 @@ func isNormalError(err error) bool {
 func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	var url string
 	var origurl string
+	actions := p.getActions(req.URL)
 	redirect := false
 	if req.Method == "CONNECT" {
 		origurl = extractHostPort(req.URL, 443)
 	} else {
 		origurl = req.URL.String()
-		if req.URL.Scheme == "http" && p.isForcedSSL(req.URL) {
+		if req.URL.Scheme == "http" && actions&actionForceHTTPS != 0 {
 			if req.Method == "GET" || req.Method == "HEAD" {
 				redirect = true
 			}
@@ -192,9 +186,13 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 	if len(url) == 0 {
 		url = origurl
 	}
-	log.Printf("%s %s", req.Method, origurl)
+	prefix := ""
+	if actions&actionDirect != 0 {
+		prefix = "(direct) "
+	}
+	log.Printf("%s%s %s", prefix, req.Method, origurl)
 
-	if p.isBlocked(req.URL) {
+	if actions&actionBlock != 0 {
 		rw.WriteHeader(503)
 		io.WriteString(rw, "Server blocked")
 		return
@@ -217,7 +215,12 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 			return
 		}
 
-		remote, err := p.dial("tcp", url)
+		dial := p.dial
+		if actions&actionDirect != 0 {
+			dial = net.Dial
+		}
+
+		remote, err := dial("tcp", url)
 		if err != nil {
 			rw.WriteHeader(503)
 			io.WriteString(rw, "CONNECT failed: "+err.Error())
@@ -286,7 +289,11 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 		return
 	}
 
-	p.proxy.ServeHTTP(rw, req)
+	if actions&actionDirect != 0 {
+		p.direct.ServeHTTP(rw, req)
+	} else {
+		p.proxy.ServeHTTP(rw, req)
+	}
 }
 
 func (p *SecureReverseProxy) ListenAndServe(addr string) error {

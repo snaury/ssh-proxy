@@ -9,34 +9,44 @@ import (
 	"strings"
 )
 
-type config struct {
-	block *regexp.Regexp
-	https *regexp.Regexp
+type configActions int
+
+const (
+	actionNone       configActions = 0
+	actionBlock      configActions = 1
+	actionProxy      configActions = 2
+	actionDirect     configActions = 4
+	actionForceHTTPS configActions = 8
+)
+
+type configCase struct {
+	mask    *regexp.Regexp
+	actions configActions
 }
 
-var configFormat = regexp.MustCompile(`\A(block|https)\s+([^\s]+)\z`)
+type config struct {
+	cases []configCase
+}
 
-func compileMasks(masks []string) *regexp.Regexp {
-	if len(masks) == 0 {
-		return nil
-	}
-	var retext string
-	for _, mask := range masks {
-		mask = regexp.QuoteMeta(mask)
-		mask = strings.Replace(mask, "\\?", ".", -1)
-		mask = strings.Replace(mask, "\\*", ".*", -1)
-		if len(retext) != 0 {
-			retext += "|"
-		}
-		retext += mask
-	}
-	return regexp.MustCompile(`\A(?:` + retext + `)\z`)
+func compileMask(mask string) *regexp.Regexp {
+	mask = regexp.QuoteMeta(mask)
+	mask = strings.Replace(mask, "\\?", ".", -1)
+	mask = strings.Replace(mask, "\\*", ".*", -1)
+	return regexp.MustCompile(`\A(?:` + mask + `)\z`)
+}
+
+var actionSeparator = regexp.MustCompile(`[ \t]+`)
+
+var actionFromString = map[string]configActions{
+	"block":  actionBlock,
+	"proxy":  actionProxy,
+	"direct": actionDirect,
+	"https":  actionForceHTTPS,
 }
 
 func loadConfigReader(reader io.Reader) (*config, error) {
 	r := bufio.NewReader(reader)
-	var blockmasks []string
-	var httpsmasks []string
+	c := &config{}
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -56,22 +66,22 @@ func loadConfigReader(reader io.Reader) (*config, error) {
 			// skip empty lines and comments
 			continue
 		}
-		g := configFormat.FindStringSubmatch(line)
-		if g == nil {
+		parts := actionSeparator.Split(line, -1)
+		if len(parts) <= 1 {
 			return nil, fmt.Errorf("cannot parse: %s", line)
 		}
-		switch g[1] {
-		case "block":
-			blockmasks = append(blockmasks, g[2])
-		case "https":
-			httpsmasks = append(httpsmasks, g[2])
-		default:
-			panic("unsupported keyword: " + g[1])
+		var actions configActions
+		for _, text := range parts[1:] {
+			action, ok := actionFromString[strings.ToLower(text)]
+			if !ok {
+				return nil, fmt.Errorf("unknown action: %q", text)
+			}
+			actions |= action
 		}
-	}
-	c := &config{
-		block: compileMasks(blockmasks),
-		https: compileMasks(httpsmasks),
+		c.cases = append(c.cases, configCase{
+			mask:    compileMask(parts[0]),
+			actions: actions,
+		})
 	}
 	return c, nil
 }

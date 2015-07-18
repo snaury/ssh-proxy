@@ -1,94 +1,77 @@
 package main
 
 import (
-	"regexp"
 	"strings"
 	"testing"
 )
 
-type configCase struct {
-	text string
-	ok   bool
-}
-
-type configCases struct {
-	text  string
-	cases []configCase
+type configTestCase struct {
+	text     string
+	expected configActions
 }
 
 type configTest struct {
-	text  string
-	err   string
-	block configCases
-	https configCases
+	text   string
+	err    string
+	checks []configTestCase
 }
 
 var configTests = []configTest{
 	{
 		text: `
 # comment
-https google.com
-https *.google.com
+google.com https proxy
+*.google.com https direct
 
 # another comment
-block ads.whatever.com
+ads.whatever.com block
 		`,
-		block: configCases{
-			text: `\A(?:ads\.whatever\.com)\z`,
-			cases: []configCase{
-				{"ads.whatever.com", true},
-				{"www.ads.whatever.com", false},
-			},
-		},
-		https: configCases{
-			text: `\A(?:google\.com|.*\.google\.com)\z`,
-			cases: []configCase{
-				{"google.com", true},
-				{"www.google.com", true},
-				{"www.more.google.com", true},
-				{"1google.com", false},
-			},
+		checks: []configTestCase{
+			{"google.com", actionProxy | actionForceHTTPS},
+			{"www.google.com", actionDirect | actionForceHTTPS},
+			{"www.more.google.com", actionDirect | actionForceHTTPS},
+			{"1google.com", actionNone},
 		},
 	},
 	{
 		text: `
 # these are good
-https google.com
-block ads.whatever.com
+google.com https
+ads.whatever.com block
 # this line is bad
-unexpected line here
+unexpected
 `,
-		err: "cannot parse: unexpected line here",
+		err: "cannot parse: unexpected",
+	},
+	{
+		text: `
+# these are good
+google.com https
+ads.whatever.com block
+# this line is bad
+unexpected action
+`,
+		err: "unknown action: \"action\"",
 	},
 	{
 		text: ``,
-		block: configCases{
-			text: ``,
-		},
-		https: configCases{
-			text: ``,
+		checks: []configTestCase{
+			{"google.com", actionNone},
 		},
 	},
 }
 
-func checkCases(t *testing.T, index int, name string, r *regexp.Regexp, cases configCases) {
-	if cases.text == "" {
-		if r != nil {
-			t.Fatalf("config #%d %s: expected nil regexp, got %q", index, name, r.String())
+func runChecks(t *testing.T, index int, config *config, checks []configTestCase) {
+	for _, tc := range checks {
+		var actions configActions
+		for _, c := range config.cases {
+			if c.mask.MatchString(tc.text) {
+				actions = c.actions
+				break
+			}
 		}
-		return
-	} else {
-		if r == nil {
-			t.Fatalf("config #%d %s: expected non-nil regexp, got nil", index, name)
-		}
-		if cases.text != r.String() {
-			t.Fatalf("config #%d %s: expected %q, got %q", index, name, cases.text, r.String())
-		}
-	}
-	for _, c := range cases.cases {
-		ok := r.MatchString(c.text)
-		if c.ok != ok {
-			t.Fatalf("config #%d %s: %s: expected %v, got %v", index, name, c.text, c.ok, ok)
+		if actions != tc.expected {
+			t.Fatalf("config #%d %s: %v (expected %v)", index, tc.text, actions, tc.expected)
 		}
 	}
 }
@@ -111,7 +94,6 @@ func TestConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("config #%d: unexpected error: %s", index, err)
 		}
-		checkCases(t, index, "block", c.block, ct.block)
-		checkCases(t, index, "https", c.https, ct.https)
+		runChecks(t, index, c, ct.checks)
 	}
 }
