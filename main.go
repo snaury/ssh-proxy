@@ -3,8 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 	"io"
 	"io/ioutil"
 	"log"
@@ -17,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 func currentUser() *user.User {
@@ -354,8 +355,9 @@ func main() {
 		log.Fatal(err)
 	}
 	sshConfig := &ssh.ClientConfig{
-		User: defaultUsername(),
-		Auth: authMethods,
+		User:            defaultUsername(),
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	p := NewSecureReverseProxy(host, config, sshConfig)
 	err = p.ListenAndServe(listenAddr)
