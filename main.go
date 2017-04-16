@@ -129,13 +129,7 @@ func (p *SecureReverseProxy) reconnectLoop() {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		p.remote = remote
-		p.remoteAvailable.Broadcast()
-		p.remoteAvailable.L.Unlock()
-		log.Printf("Connected to %s\n", remote.ServerVersion())
-		err = remote.Wait()
-		p.remoteAvailable.L.Lock()
-		p.remote = nil
+		err = p.connected(remote)
 		if err != nil {
 			log.Printf("Disconnected: %s", err)
 		}
@@ -143,13 +137,51 @@ func (p *SecureReverseProxy) reconnectLoop() {
 	}
 }
 
-func (p *SecureReverseProxy) dial(n, addr string) (net.Conn, error) {
+func (p *SecureReverseProxy) connected(remote *ssh.Client) error {
+	p.remote = remote
+	defer func() {
+		p.remote = nil
+	}()
+
+	p.remoteAvailable.Broadcast()
+	p.remoteAvailable.L.Unlock()
+	defer p.remoteAvailable.L.Lock()
+
+	log.Printf("Connected to %s\n", remote.ServerVersion())
+	stop := make(chan struct{})
+	defer close(stop)
+	go p.keepalive(remote, stop)
+	return remote.Wait()
+}
+
+func (p *SecureReverseProxy) keepalive(remote *ssh.Client, stop <-chan struct{}) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			// just try to connect somewhere once in a while, error is not important
+			c, err := remote.Dial("tcp", "127.255.255.42:0")
+			if err == nil {
+				c.Close()
+			}
+		}
+	}
+}
+
+func (p *SecureReverseProxy) waitForRemote() *ssh.Client {
 	p.remoteAvailable.L.Lock()
+	defer p.remoteAvailable.L.Unlock()
 	for p.remote == nil {
 		p.remoteAvailable.Wait()
 	}
-	remote := p.remote
-	p.remoteAvailable.L.Unlock()
+	return p.remote
+}
+
+func (p *SecureReverseProxy) dial(n, addr string) (net.Conn, error) {
+	remote := p.waitForRemote()
 	c, err := remote.Dial(n, addr)
 	if err != nil {
 		log.Printf("CONNECT %s: %s", addr, err)
@@ -357,6 +389,7 @@ func main() {
 	sshConfig := &ssh.ClientConfig{
 		User:            defaultUsername(),
 		Auth:            authMethods,
+		Timeout:         30 * time.Second,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	p := NewSecureReverseProxy(host, config, sshConfig)
