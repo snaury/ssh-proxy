@@ -200,6 +200,11 @@ func isNormalError(err error) bool {
 }
 
 func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if req.Host == "localhost" || strings.HasPrefix(req.Host, "localhost:") {
+		rw.WriteHeader(200)
+		io.WriteString(rw, "TODO: console")
+		return
+	}
 	var url string
 	var origurl string
 	actions := p.getActions(req.URL)
@@ -223,7 +228,11 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 	if actions&actionDirect != 0 {
 		prefix = "(direct) "
 	}
-	log.Printf("%s%s %s", prefix, req.Method, origurl)
+	suffix := ""
+	if actions&actionBlock != 0 {
+		suffix = " (blocked)"
+	}
+	log.Printf("%s%s %s%s", prefix, req.Method, origurl, suffix)
 
 	if actions&actionBlock != 0 {
 		rw.WriteHeader(503)
