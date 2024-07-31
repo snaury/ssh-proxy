@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -199,6 +200,203 @@ func isNormalError(err error) bool {
 	return false
 }
 
+type fragmentedReader struct {
+	io.Reader
+	header       [5]byte
+	buffer       []byte
+	handshake    []byte
+	handshakeErr error
+	processed    bool
+}
+
+var errNotHandshakeRecord = errors.New("not a handshake record")
+
+func (c *fragmentedReader) readHandshakeRecord() ([]byte, error) {
+	n, err := io.ReadFull(c.Reader, c.header[:5])
+	c.buffer = append(c.buffer, c.header[:n]...)
+	if err != nil {
+		if err == io.ErrUnexpectedEOF {
+			err = io.EOF
+		}
+		return nil, err
+	}
+	// log.Printf("readHandshakeRecord: header %q", c.header[:5])
+
+	// TLS 1.0 handshake record
+	if c.header[0] == 0x16 && c.header[1] == 0x03 && c.header[2] == 0x01 {
+		n = int(c.header[3])<<8 | int(c.header[4])
+		b := make([]byte, n)
+		n, err = io.ReadFull(c.Reader, b)
+		c.buffer = append(c.buffer, b[:n]...)
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				err = io.EOF
+			}
+			return nil, err
+		}
+
+		// log.Printf("readHandshakeRecord: data %q", b)
+		return b, nil
+	}
+
+	// not a handshake record
+	return nil, errNotHandshakeRecord
+}
+
+func (c *fragmentedReader) readHandshakeBytes(n int) error {
+	for len(c.handshake) < n {
+		b, err := c.readHandshakeRecord()
+		if err != nil {
+			return err
+		}
+		c.handshake = append(c.handshake, b...)
+	}
+	return nil
+}
+
+func (c *fragmentedReader) appendHandshakeRecord(b []byte) {
+	for len(b) > 0 {
+		n := len(b)
+		if n > 65535 {
+			n = 65535
+		}
+		c.buffer = append(c.buffer, 0x16, 0x03, 0x01, byte(n>>8), byte(n))
+		c.buffer = append(c.buffer, b[:n]...)
+		b = b[n:]
+	}
+}
+
+func findSnameExt(b []byte) (int, int) {
+	pos := 0
+	for len(b) >= 4 {
+		n := int(b[2])<<8 | int(b[3])
+		if !(4+n <= len(b)) {
+			break
+		}
+		if b[0] == 0 && b[1] == 0 {
+			return pos + 4, n
+		}
+		b = b[4+n:]
+		pos += 4 + n
+	}
+	return -1, -1
+}
+
+func (c *fragmentedReader) processClientHello() error {
+	err := c.readHandshakeBytes(4)
+	if err != nil {
+		log.Printf("failed to read 4 bytes (client hello header): %s", err)
+		if err == errNotHandshakeRecord {
+			err = nil
+		}
+		return err
+	}
+	if c.handshake[0] != 0x01 {
+		// expected client hello message
+		return nil
+	}
+	n := int(c.handshake[1])<<16 | int(c.handshake[2])<<8 | int(c.handshake[3])
+	err = c.readHandshakeBytes(4 + n)
+	if err != nil {
+		log.Printf("failed to read %d bytes (client hello data): %s", n, err)
+		if err == errNotHandshakeRecord {
+			err = nil
+		}
+		return err
+	}
+	pos := 4
+	end := 4 + n
+	if !(pos+2 <= end) || c.handshake[pos] != 0x03 || c.handshake[pos+1] != 0x03 {
+		// expected TLS 1.2 outer layer
+		return nil
+	}
+	pos += 2 + 32
+	// skip session id
+	if !(pos+1 <= end) {
+		return nil
+	}
+	k := int(c.handshake[pos])
+	pos += 1 + k
+	// skip cipher suites
+	if !(pos+2 <= end) {
+		return nil
+	}
+	k = int(c.handshake[pos])<<8 | int(c.handshake[pos+1])
+	pos += 2 + k
+	// skip compression methods
+	if !(pos+1 <= end) {
+		return nil
+	}
+	k = int(c.handshake[pos])
+	pos += 1 + k
+	// extensions
+	if !(pos+2 <= end) {
+		return nil
+	}
+	extSize := int(c.handshake[pos])<<8 | int(c.handshake[pos+1])
+	if extSize < 4 {
+		return nil
+	}
+	pos += 2
+	extStart := pos
+	extEnd := extStart + extSize
+	if !(extEnd <= end) {
+		return nil
+	}
+	ext := c.handshake[extStart:extEnd]
+
+	// log.Printf("Full handshake: %x", c.handshake)
+	// log.Printf("Found extensions: %q", ext)
+
+	snameStart, snameSize := findSnameExt(ext)
+	if snameStart >= 0 {
+		// we found a server name extension
+		// let's repackage it into small fragmented records
+		snameStart += extStart
+		snameEnd := snameStart + snameSize
+		log.Printf("Fragmenting sname: %q", c.handshake[snameStart:snameEnd])
+		pos = snameStart - 3 // we want to fragment the 00 00 tag as well
+		// log.Printf("Original buffer: %q", c.buffer)
+		c.buffer = c.buffer[:0]
+		c.appendHandshakeRecord(c.handshake[:pos])
+		for pos+2 < snameEnd {
+			c.appendHandshakeRecord(c.handshake[pos : pos+2])
+			pos += 2
+		}
+		c.appendHandshakeRecord(c.handshake[pos:])
+		// log.Printf("Final buffer: %q", c.buffer)
+	}
+
+	return nil
+}
+
+func (c *fragmentedReader) Read(b []byte) (int, error) {
+	if !c.processed {
+		err := c.processClientHello()
+		if err != nil {
+			c.handshakeErr = err
+		}
+		c.processed = true
+	}
+	if len(c.buffer) > 0 {
+		n := len(c.buffer)
+		if n > len(b) {
+			n = len(b)
+		}
+		copy(b[:n], c.buffer[:n])
+		c.buffer = c.buffer[n:]
+		if len(c.buffer) == 0 {
+			c.buffer = nil
+		}
+		return n, nil
+	}
+	if c.handshakeErr != nil {
+		return 0, c.handshakeErr
+	}
+	n, err := c.Reader.Read(b)
+	return n, err
+}
+
 func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if req.Host == "localhost" || strings.HasPrefix(req.Host, "localhost:") {
 		rw.WriteHeader(200)
@@ -227,6 +425,9 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 	prefix := ""
 	if actions&actionDirect != 0 {
 		prefix = "(direct) "
+	}
+	if actions&actionFragment != 0 {
+		prefix += "(fragmented) "
 	}
 	suffix := ""
 	if actions&actionBlock != 0 {
@@ -281,11 +482,11 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 		io.WriteString(b, "HTTP/1.1 200 OK\r\n\r\n")
 		b.Flush() // this is the last write into b
 
-		// write side runs it its own goroutine
+		// write side runs in its own goroutine
 		go func() {
 			defer local.Close()
 			defer remote.Close()
-			var buffer [65536]byte
+			var buffer [1024]byte
 			done := false
 			for !done {
 				n, err := remote.Read(buffer[:])
@@ -307,11 +508,18 @@ func (p *SecureReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request
 			}
 		}()
 
+		var r io.Reader = b
+		if actions&actionFragment != 0 {
+			r = &fragmentedReader{
+				Reader: r,
+			}
+		}
+
 		// read side runs here, first we grab what we have in in b
-		var buffer [65536]byte
+		var buffer [1024]byte
 		done := false
 		for !done {
-			n, err := b.Read(buffer[:])
+			n, err := r.Read(buffer[:])
 			if n > 0 {
 				_, werr := remote.Write(buffer[:n])
 				if werr != nil {

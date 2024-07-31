@@ -17,6 +17,7 @@ const (
 	actionProxy      configActions = 2
 	actionDirect     configActions = 4
 	actionForceHTTPS configActions = 8
+	actionFragment   configActions = 16
 )
 
 type configCase struct {
@@ -38,10 +39,11 @@ func compileMask(mask string) *regexp.Regexp {
 var actionSeparator = regexp.MustCompile(`[ \t]+`)
 
 var actionFromString = map[string]configActions{
-	"block":  actionBlock,
-	"proxy":  actionProxy,
-	"direct": actionDirect,
-	"https":  actionForceHTTPS,
+	"block":    actionBlock,
+	"proxy":    actionProxy,
+	"direct":   actionDirect,
+	"https":    actionForceHTTPS,
+	"fragment": actionFragment,
 }
 
 func loadConfigReader(reader io.Reader) (*config, error) {
